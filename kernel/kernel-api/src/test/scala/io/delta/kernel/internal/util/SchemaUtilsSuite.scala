@@ -1141,6 +1141,43 @@ class SchemaUtilsSuite extends AnyFunSuite {
       "Cannot change the type of existing field id from integer to string")
   }
 
+  private val mapWithStructKeyIcebergCompatV2 = mapWithStructKey(mapFieldMetadata =
+    FieldMetadata.builder()
+      .fromMetadata(fieldMetadata(id = 1, physicalName = "map"))
+      .putFieldMetadata(
+        COLUMN_MAPPING_NESTED_IDS_KEY,
+        FieldMetadata.builder().putLong("map.key", 5L)
+          .putLong("map.value", 6L).build()).build())
+
+  private val structWithArrayOfStructsIcebergCompatV2 =
+    structWithArrayOfStructs(arrayMetadata =
+      FieldMetadata.builder().fromMetadata(fieldMetadata(2L, "array")).putFieldMetadata(
+        COLUMN_MAPPING_NESTED_IDS_KEY,
+        FieldMetadata.builder().putLong("top_level_struct.array.element", 3L).build()).build())
+
+  private val missingNestedIdsEvolution = Table(
+    ("schemaBefore", "updatedSchemaWithNoNestedId"),
+    // Map with struct key missing nested IDs
+    (
+      mapWithStructKeyIcebergCompatV2,
+      mapWithStructKey),
+    // Struct with array of struct field where inner struct is missing nested IDs
+    (
+      structWithArrayOfStructsIcebergCompatV2,
+      structWithArrayOfStructs))
+
+
+  test("validateUpdatedSchema with valid nested IDs succeeds in IcebergCompatV2") {
+    val validNestedIdsEvolution =
+      missingNestedIdsEvolution.map(evolution => (evolution._2, evolution._1))
+    forAll(validNestedIdsEvolution) { (schemaBefore, schemaAfter) =>
+      val tableProperties =
+        Map(COLUMN_MAPPING_MODE_KEY -> "id", "delta.enableIcebergCompatV2" -> "true")
+      val idToParent = SchemaUtils.idToParent(mapWithStructKey, false)
+      val a = 4
+    }
+  }
+
   private def mapWithStructKey(
       mapType: DataType =
         mapWithStructKey.get("map").getDataType,

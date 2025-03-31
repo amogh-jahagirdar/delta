@@ -17,6 +17,7 @@ package io.delta.kernel.internal.util;
 
 import static io.delta.kernel.internal.DeltaErrors.*;
 import static io.delta.kernel.internal.util.ColumnMapping.*;
+import static io.delta.kernel.internal.util.ColumnMapping.getNestedColumnIds;
 import static io.delta.kernel.internal.util.Preconditions.checkArgument;
 
 import io.delta.kernel.exceptions.KernelException;
@@ -402,8 +403,8 @@ public class SchemaUtils {
    * fields
    */
   private static void validateSchemaEvolutionById(StructType currentSchema, StructType newSchema) {
-    Map<Long, StructField> currentFieldsById = fieldsById(currentSchema);
-    Map<Long, StructField> updatedFieldsById = fieldsById(newSchema);
+    Map<Integer, StructField> currentFieldsById = fieldsById(currentSchema);
+    Map<Integer, StructField> updatedFieldsById = fieldsById(newSchema);
     SchemaChanges schemaChanges = computeSchemaChangesById(currentFieldsById, updatedFieldsById);
     validatePhysicalNameConsistency(schemaChanges.updatedFields());
     validateUpdatedSchemaCompatibility(schemaChanges);
@@ -417,75 +418,6 @@ public class SchemaUtils {
    *   <li>no non-nullable fields are added
    *   <li>no tightening of existing fields
    *   <li>no type changes are performed
-   */
-  private static void validateUpdatedSchemaCompatibility(SchemaChanges schemaChanges) {
-    for (StructField addedField : schemaChanges.addedFields()) {
-      if (!addedField.isNullable()) {
-        throw new KernelException(
-            String.format("Cannot add non-nullable field %s", addedField.getName()));
-      }
-    }
-
-    for (Tuple2<StructField, StructField> updatedFields : schemaChanges.updatedFields()) {
-      validateNoTypeChange(updatedFields._1, updatedFields._2);
-    }
-  }
-
-  /**
-   * Validate that there was no change in type from existing field from new field, excluding
-   * modified, dropped, or added fields to structs.
-   */
-  private static void validateNoTypeChange(StructField existingField, StructField newField) {
-    if (existingField.isNullable() && !newField.isNullable()) {
-      throw new KernelException(
-          String.format(
-              "Cannot tighten the nullability of existing field %s", existingField.getName()));
-    }
-
-    // Both fields are structs, ensure there's no changes in the individual fields
-    // ToDo: Prevent additions, removals, and type updates to struct fields when the struct is a map
-    // key
-    if (existingField.getDataType() instanceof StructType
-        && newField.getDataType() instanceof StructType) {
-      StructType existingStruct = (StructType) existingField.getDataType();
-      StructType newStruct = (StructType) newField.getDataType();
-      Map<Integer, StructField> existingStructFieldsById =
-          existingStruct.fields().stream()
-              .collect(Collectors.toMap(ColumnMapping::getColumnId, Function.identity()));
-
-      for (StructField newNestedField : newStruct.fields()) {
-        StructField existingNestedFields =
-            existingStructFieldsById.get(getColumnId(newNestedField));
-        if (existingNestedFields != null) {
-          validateNoTypeChange(existingNestedFields, newNestedField);
-        }
-      }
-    } else if (existingField.getDataType() instanceof MapType
-        && newField.getDataType() instanceof MapType) {
-      MapType existingMapType = (MapType) existingField.getDataType();
-      MapType newMapType = (MapType) newField.getDataType();
-
-      validateNoTypeChange(existingMapType.getKeyField(), newMapType.getKeyField());
-      validateNoTypeChange(existingMapType.getValueField(), newMapType.getValueField());
-    } else if (existingField.getDataType() instanceof ArrayType
-        && newField.getDataType() instanceof ArrayType) {
-      ArrayType existingArrayType = (ArrayType) existingField.getDataType();
-      ArrayType newArrayType = (ArrayType) newField.getDataType();
-
-      validateNoTypeChange(existingArrayType.getElementField(), newArrayType.getElementField());
-    } else if (!existingField.getDataType().equivalent(newField.getDataType())) {
-      throw new KernelException(
-          String.format(
-              "Cannot change the type of existing field %s from %s to %s",
-              existingField.getName(), existingField.getDataType(), newField.getDataType()));
-    }
-  }
-
-  /**
-   * Verifies that no non-nullable fields are added, no existing field nullability is tightened and
-   * no invalid type changes are performed
-   *
-   * <p>ToDo: Prevent moving fields outside of their containing struct
    */
   private static void validateUpdatedSchemaCompatibility(SchemaChanges schemaChanges) {
     for (StructField addedField : schemaChanges.addedFields()) {
@@ -575,6 +507,94 @@ public class SchemaUtils {
     }
 
     return columnIdToField;
+  }
+
+  static Map<Long, Long> idToParent(StructType schema, boolean icebergCompatV2) {
+    Map<Long, Long> idToParent = new HashMap<>();
+    for (StructField field : schema.fields()) {
+      computeIdToParent(field, icebergCompatV2, idToParent, null, getPhysicalName(field));
+    }
+
+    return idToParent;
+  }
+
+  private static void computeIdToParent(
+      StructField field,
+      boolean icebergCompatV2,
+      Map<Long, Long> idToParent,
+      Long currentParent,
+      String fieldPath) {
+    if (!(field.getDataType() instanceof StructType
+        || field.getDataType() instanceof ArrayType
+        || (field.getDataType() instanceof MapType))) {
+      return;
+    }
+
+    long nearestAncestorFieldId = hasColumnId(field) ? getColumnId(field) : currentParent;
+
+    if (field.getDataType() instanceof StructType) {
+      StructType structType = (StructType) field.getDataType();
+      for (StructField nestedField : structType.fields()) {
+        idToParent.put((long) getColumnId(nestedField), nearestAncestorFieldId);
+        computeIdToParent(
+            nestedField,
+            icebergCompatV2,
+            idToParent,
+            nearestAncestorFieldId,
+            fieldPath + "." + getPhysicalName(nestedField));
+      }
+    } else if (field.getDataType() instanceof MapType) {
+      MapType mapType = (MapType) field.getDataType();
+      long mapKeyNearestAncestor;
+      long mapValueNearestAncestor;
+      if (icebergCompatV2) {
+        checkArgument(
+            hasNestedColumnIds(field),
+            "Map data types in icebergCompatV2 must have nested ID metadata defined for key and value");
+        FieldMetadata nestedMetadata = getNestedColumnIds(field);
+        mapKeyNearestAncestor = nestedMetadata.getLong(fieldPath + ".key");
+        mapValueNearestAncestor = nestedMetadata.getLong(fieldPath + ".value");
+        idToParent.put(mapKeyNearestAncestor, nearestAncestorFieldId);
+        idToParent.put(mapValueNearestAncestor, nearestAncestorFieldId);
+      } else {
+        mapKeyNearestAncestor = nearestAncestorFieldId;
+        mapValueNearestAncestor = nearestAncestorFieldId;
+      }
+
+      computeIdToParent(
+          mapType.getKeyField(),
+          icebergCompatV2,
+          idToParent,
+          mapKeyNearestAncestor,
+          fieldPath + ".key");
+      computeIdToParent(
+          mapType.getValueField(),
+          icebergCompatV2,
+          idToParent,
+          mapValueNearestAncestor,
+          fieldPath + ".value");
+
+    } else if (field.getDataType() instanceof ArrayType) {
+      ArrayType arrayType = (ArrayType) field.getDataType();
+      long elementNearestAncestor;
+      if (icebergCompatV2) {
+        checkArgument(
+            hasNestedColumnIds(field),
+            "Array data types in icebergCompatV2 must have nested ID metadata defined for the array element");
+        FieldMetadata nestedMetadata = getNestedColumnIds(field);
+        elementNearestAncestor = nestedMetadata.getLong(fieldPath + ".element");
+        idToParent.put(elementNearestAncestor, nearestAncestorFieldId);
+      } else {
+        elementNearestAncestor = nearestAncestorFieldId;
+      }
+
+      computeIdToParent(
+          arrayType.getElementField(),
+          icebergCompatV2,
+          idToParent,
+          elementNearestAncestor,
+          fieldPath + ".element");
+    }
   }
 
   /** column name by concatenating the column path elements (think of nested) with dots */
